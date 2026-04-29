@@ -1,0 +1,88 @@
+_format_version: "3.0"
+
+services:
+  # Auth Service
+  - name: auth-service
+    url: http://auth-service    routes:
+     :8001
+ - name: auth-route
+        paths:
+          - /v1/auth
+    plugins:
+      - name: rate-limiting
+        config:
+          minute: 100
+          policy: local
+
+  # Resume Service
+  - name: resume-service
+    url: http://resume-service:8002
+    routes:
+      - name: resume-route
+        paths:
+          - /v1/resumes
+
+  # Interview Service
+  - name: interview-service
+    url: http://interview-service:8003
+    routes:
+      - name: interview-route
+        paths:
+          - /v1/interviews
+
+  # DSA Service
+  - name: dsa-service
+    url: http://dsa-service:8004
+    routes:
+      - name: dsa-route
+        paths:
+          - /v1/dsa
+
+  # AI Engine
+  - name: ai-engine
+    url: http://ai-engine:8005
+    routes:
+      - name: ai-route
+        paths:
+          - /v1/ai
+
+consumers:
+  - username: default
+    keyauth_credentials:
+      - key: default-api-key
+
+plugins:
+  - name: cors
+    config:
+      origins:
+        - "*"
+      methods:
+        - GET
+        - POST
+        - PUT
+        - DELETE
+        - OPTIONS
+      headers:
+        - Accept
+        - Authorization
+        - Content-Type
+      exposed_headers:
+        - X-Total-Count
+      credentials: true
+      max_age: 3600
+
+  - name: request-transformer
+    config:
+      add:
+        headers:
+          - X-Gateway:kong
+
+  - name: response-transformer
+    config:
+      add:
+        headers:
+          - X-Powered-By:AI-Mock-Interview
+
+  - name: prometheus
+    config:
+      per_consumer: false

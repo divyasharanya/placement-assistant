@@ -1,0 +1,220 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: aimock-postgres
+    environment:
+      POSTGRES_USER: aimock
+      POSTGRES_PASSWORD: aimock_password
+      POSTGRES_DB: aimock
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aimock"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    container_name: aimock-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MongoDB
+  mongo:
+    image: mongo:7
+    container_name: aimock-mongo
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: aimock
+      MONGO_INITDB_ROOT_PASSWORD: aimock_password
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  # Auth Service
+  auth-service:
+    build:
+      context: ../backend/auth-service
+      dockerfile: Dockerfile
+    container_name: aimock-auth-service
+    environment:
+      DATABASE_URL: postgresql+asyncpg://aimock:aimock_password@postgres:5432/aimock
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Resume Service
+  resume-service:
+    build:
+      context: ../backend/resume-service
+      dockerfile: Dockerfile
+    container_name: aimock-resume-service
+    environment:
+      DATABASE_URL: postgresql+asyncpg://aimock:aimock_password@postgres:5432/aimock
+      REDIS_URL: redis://redis:6379/0
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      PINECONE_API_KEY: ${PINECONE_API_KEY}
+    ports:
+      - "8002:8002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Interview Service
+  interview-service:
+    build:
+      context: ../backend/interview-service
+      dockerfile: Dockerfile
+    container_name: aimock-interview-service
+    environment:
+      DATABASE_URL: postgresql+asyncpg://aimock:aimock_password@postgres:5432/aimock
+      REDIS_URL: redis://redis:6379/0
+      AI_ENGINE_URL: http://ai-engine:8005
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # DSA Service
+  dsa-service:
+    build:
+      context: ../backend/dsa-service
+      dockerfile: Dockerfile
+    container_name: aimock-dsa-service
+    environment:
+      DATABASE_URL: postgresql+asyncpg://aimock:aimock_password@postgres:5432/aimock
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8004:8004"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # AI Engine Service
+  ai-engine:
+    build:
+      context: ../backend/ai-engine
+      dockerfile: Dockerfile
+    container_name: aimock-ai-engine
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8005:8005"
+
+  # Voice Service (Future)
+  # voice-service:
+  #   build:
+  #     context: ../backend/voice-service
+  #     dockerfile: Dockerfile
+  #   environment:
+  #     DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY}
+  #     ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY}
+  #   ports:
+  #     - "8006:8006"
+
+  # API Gateway (Kong)
+  kong:
+    image: kong:3.4
+    container_name: aimock-kong
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /usr/local/kong/kong.yml
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+    volumes:
+      - ./kong.yml:/usr/local/kong/kong.yml:ro
+    depends_on:
+      - auth-service
+      - resume-service
+      - interview-service
+      - dsa-service
+      - ai-engine
+
+  # Frontend
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: aimock-frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://kong:8000
+      NEXT_PUBLIC_WS_URL: ws://kong:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - kong
+
+  # Prometheus (Monitoring)
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: aimock-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  # Grafana (Monitoring)
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: aimock-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+  redis_data:
+  mongo_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  default:
+    name: aimock-network
