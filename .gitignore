@@ -1,7 +1,14 @@
 node_modules/
 .env
+*.env
+api.env
 *.log
 backend/data/*.json
+backend/uploads/
 frontend/.next/
 frontend/node_modules/
 backend/node_modules/
+__pycache__/
+*.pyc
+*.tsbuildinfo
+Microsoft/
