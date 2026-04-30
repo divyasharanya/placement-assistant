@@ -53,11 +53,28 @@ from database.models import (
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/aimock")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-with open(r"D:\placement_assisstant\backend\resume-service\api.txt", "r") as f:
-    OPENAI_API_KEY = f.read().strip()
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY", "")
-AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY", "")
+
+# ── API key resolution (env var wins; fall back to local api.txt for dev) ──
+def _load_api_key() -> str:
+    # 1. Environment variable (Docker / production / CI)
+    key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if key:
+        return key
+
+    # 2. Local api.txt relative to this file (developer convenience)
+    local_txt = Path(__file__).parent / "api.txt"
+    if local_txt.exists():
+        key = local_txt.read_text(encoding="utf-8").strip()
+        if key:
+            return key
+
+    return ""
+
+OPENROUTER_API_KEY = _load_api_key()
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# Model name must use OpenRouter's namespaced format
+AI_MODEL = "openai/gpt-4o-mini"
+
 FRONTEND_ORIGINS = os.getenv(
     "FRONTEND_ORIGINS",
     "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001"
@@ -151,32 +168,39 @@ class ResumeHistoryResponse(BaseModel):
 
 class ResumeService:
     def __init__(self):
-        self.openai_key = OPENAI_API_KEY
-        self.pinecone_key = PINECONE_API_KEY
-    
+        self.openai_key = OPENROUTER_API_KEY
+
+    def _get_ai_client(self) -> Optional[Any]:
+        """Return an OpenRouter-compatible AsyncOpenAI client, or None."""
+        if not self.openai_key or AsyncOpenAI is None:
+            return None
+        return AsyncOpenAI(
+            api_key=self.openai_key,
+            base_url=OPENROUTER_BASE_URL,
+        )
+
     def validate_file_type(self, filename: str) -> bool:
         """Validate that the file is a valid resume format (PDF, DOC, DOCX)"""
         if not filename:
             return False
         ext = Path(filename).suffix.lower()
         return ext in ALLOWED_EXTENSIONS
-    
+
     def extract_text_from_file(self, content: bytes, filename: str) -> str:
         """Extract text from supported file types. Returns empty string on failure."""
         ext = Path(filename).suffix.lower()
-        
+
         if ext == '.pdf':
             return self._extract_from_pdf(content)
         elif ext in ['.docx', '.doc']:
             return self._extract_from_docx(content)
         else:
             return ""
-    
+
     def _extract_from_pdf(self, content: bytes) -> str:
         """Extract text from PDF using pypdf."""
         if PdfReader is None:
             return ""
-        
         try:
             pdf_file = BytesIO(content)
             pdf_reader = PdfReader(pdf_file)
@@ -189,12 +213,11 @@ class ResumeService:
         except Exception as e:
             print(f"PDF extraction error: {e}")
             return ""
-    
+
     def _extract_from_docx(self, content: bytes) -> str:
         """Extract text from DOCX using python-docx"""
         if docx is None:
             return ""
-        
         try:
             doc_file = BytesIO(content)
             document = docx.Document(doc_file)
@@ -202,8 +225,6 @@ class ResumeService:
             for para in document.paragraphs:
                 if para.text.strip():
                     text_parts.append(para.text)
-            
-            # Also extract text from tables
             for table in document.tables:
                 for row in table.rows:
                     for cell in row.cells:
@@ -213,30 +234,22 @@ class ResumeService:
         except Exception as e:
             print(f"DOCX extraction error: {e}")
             return ""
-    
+
     async def parse_resume(self, resume_id: UUID, raw_content: str) -> Dict[str, Any]:
-        """Parse resume content via OpenAI. No mock fallback."""
+        """Parse resume content via OpenRouter AI. No mock fallback."""
         if not raw_content or len(raw_content.strip()) < MIN_TEXT_LENGTH:
             raise HTTPException(
                 status_code=400,
                 detail="Could not extract readable text from file. Ensure it's a text-based PDF/DOCX, not a scanned image or encrypted file."
             )
-        
-        if not self.openai_key:
+
+        client = self._get_ai_client()
+        if client is None:
             raise HTTPException(
                 status_code=503,
-                detail="Resume parsing is unavailable because OPENAI_API_KEY is not configured."
-            )
-        if AsyncOpenAI is None:
-            raise HTTPException(
-                status_code=503,
-                detail="OpenAI client library is not installed in resume service."
+                detail="Resume parsing is unavailable: OPENROUTER_API_KEY is not configured."
             )
 
-        client = AsyncOpenAI(
-        api_key=self.openai_key,
-        base_url="https://openrouter.ai/api/v1"
-        )
         truncated_content = raw_content[:8000]
         prompt = (
             "Extract resume data from the text below. Return ONLY a valid JSON object with keys: "
@@ -247,7 +260,7 @@ class ResumeService:
 
         try:
             completion = await client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=AI_MODEL,
                 messages=[
                     {"role": "system", "content": "You are a resume parser that outputs strict JSON only."},
                     {"role": "user", "content": prompt},
@@ -257,12 +270,15 @@ class ResumeService:
             )
             raw_json = completion.choices[0].message.content or "{}"
             parsed_data = json.loads(raw_json)
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Resume parsing failed: {str(e)}")
 
         if not isinstance(parsed_data, dict):
             raise HTTPException(status_code=502, detail="Resume parser returned invalid format.")
 
+        # Normalise fields
         if not isinstance(parsed_data.get("skills", []), list):
             parsed_data["skills"] = []
         if not isinstance(parsed_data.get("experience", []), list):
@@ -293,76 +309,56 @@ class ResumeService:
             if name and name.lower() not in [s.lower() for s in names]:
                 names.append(name)
         return names
-    
+
     async def generate_professional_ats_analysis(
-        self, 
-        parsed_data: Dict[str, Any], 
+        self,
+        parsed_data: Dict[str, Any],
         target_role: Optional[str] = None
     ) -> Dict[str, Any]:
         """Generate a professional structured ATS analysis"""
-        
-        # Get role-specific keywords
+
         target = target_role or "software engineer"
         required_keywords = self._get_role_keywords(target)
-        
-        # Extract skills from parsed data (supports list[str] and list[dict])
+
         skills_detected = self._extract_skill_names(parsed_data)
-        
-        # Find missing skills
-        missing_skills = [kw for kw in required_keywords 
-                        if kw.lower() not in [s.lower() for s in skills_detected]]
-        
-        # Generate strengths based on what's actually in the resume
+
+        missing_skills = [kw for kw in required_keywords
+                          if kw.lower() not in [s.lower() for s in skills_detected]]
+
         strengths = []
-        
         if parsed_data.get("experience") and len(parsed_data.get("experience", [])) > 0:
             strengths.append("Work experience section present")
-        
         if parsed_data.get("education") and len(parsed_data.get("education", [])) > 0:
             strengths.append("Education section present")
-        
-        if skills_detected and len(skills_detected) > 0:
+        if skills_detected:
             strengths.append(f"Listed {len(skills_detected)} technical skills")
-        
         if parsed_data.get("projects") and len(parsed_data.get("projects", [])) > 0:
             strengths.append("Projects section showcases practical work")
-        
         if parsed_data.get("professional_summary") and parsed_data.get("professional_summary") != "Not found":
             strengths.append("Professional summary provides quick overview")
-        
-        # Generate improvements
+
         improvements = []
-        
         if len(skills_detected) < 5:
             improvements.append("Add more technical skills relevant to your target role")
-        
         if not parsed_data.get("projects"):
             improvements.append("Add a projects section to showcase practical work")
-        
         if not parsed_data.get("professional_summary") or parsed_data.get("professional_summary") == "Not found":
             improvements.append("Add a professional summary at the top of your resume")
-        
         if missing_skills:
             improvements.append(f"Consider adding: {', '.join(missing_skills[:3])}")
-        
-        # Generate suggestions
+
         suggestions = []
-        
         if missing_skills:
             suggestions.append(f"Include missing keywords: {', '.join(missing_skills[:5])}")
-        
         suggestions.append("Use standard section headings (Experience, Education, Skills)")
         suggestions.append("Keep formatting consistent throughout the resume")
-        
         if parsed_data.get("experience"):
             suggestions.append("Quantify achievements with numbers and percentages")
-        
         if skills_detected:
             suggestions.append("Organize skills by category (Languages, Frameworks, Tools)")
-        
-        # Calculate ATS score
+
         ats_result = await self.calculate_ats_score(parsed_data, target_role)
-        
+
         return {
             "atsScore": ats_result.get("overall", 0),
             "skillsDetected": skills_detected,
@@ -373,50 +369,43 @@ class ResumeService:
             "professionalFeedback": _generate_analysis_summary(ats_result.get("overall", 0)),
             "detailedAnalysis": ats_result
         }
-    
+
     async def calculate_ats_score(
-        self, 
-        parsed_data: Dict[str, Any], 
+        self,
+        parsed_data: Dict[str, Any],
         target_role: Optional[str] = None
     ) -> Dict[str, Any]:
         """Calculate ATS score with detailed breakdown"""
-        
+
         scores = {}
         improvements = []
-        
-        # 1. Keyword Matching (30%)
+
         keyword_score, keyword_improvements = self._score_keywords(parsed_data, target_role)
         scores['keyword_match'] = keyword_score * 0.30
         improvements.extend(keyword_improvements)
-        
-        # 2. Formatting & Parseability (20%)
+
         format_score, format_improvements = self._score_formatting(parsed_data)
         scores['formatting'] = format_score * 0.20
         improvements.extend(format_improvements)
-        
-        # 3. Experience Quality (25%)
+
         exp_score, exp_improvements = self._score_experience(parsed_data)
         scores['experience'] = exp_score * 0.25
         improvements.extend(exp_improvements)
-        
-        # 4. Education & Certifications (10%)
+
         edu_score, edu_improvements = self._score_education(parsed_data, target_role)
         scores['education'] = edu_score * 0.10
         improvements.extend(edu_improvements)
-        
-        # 5. Completeness (10%)
+
         complete_score, complete_improvements = self._score_completeness(parsed_data)
         scores['completeness'] = complete_score * 0.10
         improvements.extend(complete_improvements)
-        
-        # 6. Impact & Achievements (5%)
+
         impact_score, impact_improvements = self._score_impact(parsed_data)
         scores['impact'] = impact_score * 0.05
         improvements.extend(impact_improvements)
-        
+
         overall = sum(scores.values())
-        
-        # Calculate percentile based on score
+
         if overall >= 0.8:
             percentile = 85.0
         elif overall >= 0.6:
@@ -425,7 +414,7 @@ class ResumeService:
             percentile = 45.0
         else:
             percentile = 25.0
-        
+
         return {
             "overall": round(overall * 100, 1),
             "sections": {k: round(v * 100, 1) for k, v in scores.items()},
@@ -436,141 +425,90 @@ class ResumeService:
             "improvements": self._prioritize_improvements(improvements, overall),
             "competitive_percentile": percentile
         }
-    
-    def _score_keywords(
-        self, 
-        parsed_data: Dict[str, Any], 
-        target_role: Optional[str]
-    ) -> tuple[float, List[Dict]]:
-        """Analyze keyword relevance"""
-        
+
+    def _score_keywords(self, parsed_data, target_role) -> tuple:
         required_keywords = self._get_role_keywords(target_role or "software engineer")
-        
         found_keywords = set()
         resume_text = json.dumps(parsed_data).lower()
-        
         for keyword in required_keywords:
             if keyword.lower() in resume_text:
                 found_keywords.add(keyword)
-        
         match_ratio = len(found_keywords) / len(required_keywords) if required_keywords else 1.0
         score = min(match_ratio, 1.0)
-        
         feedback = []
         if match_ratio < 0.5:
             missing = set(required_keywords) - found_keywords
             feedback.append({
                 "issue": f"Add missing key skills: {', '.join(list(missing)[:5])}",
-                "category": "keyword",
-                "impact": 8,
-                "priority": "high"
+                "category": "keyword", "impact": 8, "priority": "high"
             })
-        
         return score, feedback
-    
-    def _score_formatting(self, parsed_data: Dict) -> tuple[float, List[Dict]]:
-        """Check formatting quality"""
-        
+
+    def _score_formatting(self, parsed_data: Dict) -> tuple:
         score = 0.85
         feedback = []
-        
         required_sections = ["contact_info", "experience", "education"]
         missing = [s for s in required_sections if s not in parsed_data]
-        
         if missing:
             score -= 0.1 * len(missing)
             feedback.append({
                 "issue": f"Missing sections: {', '.join(missing)}",
-                "category": "format",
-                "impact": 6,
-                "priority": "medium"
+                "category": "format", "impact": 6, "priority": "medium"
             })
-        
         return max(0, score), feedback
-    
-    def _score_experience(self, parsed_data: Dict) -> tuple[float, List[Dict]]:
-        """Evaluate experience quality"""
-        
+
+    def _score_experience(self, parsed_data: Dict) -> tuple:
         score = 0.8
         feedback = []
-        
         experiences = parsed_data.get("experience", [])
-        
         if not experiences:
             return 0.0, [{"issue": "Add work experience", "category": "content", "impact": 10, "priority": "critical"}]
-        
         for exp in experiences:
             has_metrics = any(
-                c.isdigit() or "$" in c or "%" in c 
+                c.isdigit() or "$" in c or "%" in c
                 for c in exp.get("key_achievements", [])
             )
             if not has_metrics:
                 score -= 0.1
                 feedback.append({
                     "issue": f"Add quantified achievements at {exp.get('company')}",
-                    "category": "content",
-                    "impact": 5,
-                    "priority": "medium"
+                    "category": "content", "impact": 5, "priority": "medium"
                 })
-        
         return max(0, min(score, 1)), feedback
-    
-    def _score_education(self, parsed_data: Dict, target_role: Optional[str]) -> tuple[float, List[Dict]]:
-        """Check education"""
-        
-        score = 0.9
-        feedback = []
-        
+
+    def _score_education(self, parsed_data: Dict, target_role: Optional[str]) -> tuple:
         education = parsed_data.get("education", [])
-        
         if not education:
             return 0.5, [{"issue": "Add education section", "category": "content", "impact": 5, "priority": "medium"}]
-        
-        return score, feedback
-    
-    def _score_completeness(self, parsed_data: Dict) -> tuple[float, List[Dict]]:
-        """Check overall completeness"""
-        
+        return 0.9, []
+
+    def _score_completeness(self, parsed_data: Dict) -> tuple:
         required = ["contact_info", "professional_summary", "skills", "experience", "education"]
         present = [r for r in required if r in parsed_data and parsed_data[r]]
-        
         score = len(present) / len(required)
-        
         feedback = []
         if score < 1.0:
             missing = set(required) - set(present)
             feedback.append({
                 "issue": f"Complete missing sections: {', '.join(missing)}",
-                "category": "completeness",
-                "impact": 7,
-                "priority": "high"
+                "category": "completeness", "impact": 7, "priority": "high"
             })
-        
         return score, feedback
-    
-    def _score_impact(self, parsed_data: Dict) -> tuple[float, List[Dict]]:
-        """Assess impact through achievements"""
-        
+
+    def _score_impact(self, parsed_data: Dict) -> tuple:
         score = 0.7
         feedback = []
-        
         experiences = parsed_data.get("experience", [])
         total_achievements = sum(len(e.get("key_achievements", [])) for e in experiences)
-        
         if total_achievements < 3:
             score -= 0.2
             feedback.append({
                 "issue": "Add more quantified achievements (%, $, time saved)",
-                "category": "enhance",
-                "impact": 4,
-                "priority": "low"
+                "category": "enhance", "impact": 4, "priority": "low"
             })
-        
         return max(0, score), feedback
-    
+
     def _get_role_keywords(self, role: str) -> List[str]:
-        """Get required keywords for a role"""
-        
         common_keywords = {
             "software engineer": [
                 "Python", "JavaScript", "Java", "React", "Node.js", "AWS", "SQL",
@@ -585,26 +523,17 @@ class ResumeService:
                 "CI/CD", "Linux", "Scripting", "Monitoring", "Ansible"
             ]
         }
-        
         return common_keywords.get(role.lower(), common_keywords["software engineer"])
-    
+
     def _prioritize_improvements(self, feedback: List[Dict], overall_score: float) -> List[Dict]:
-        """Prioritize improvements by ROI"""
-        
         impact_weights = {
-            "missing": 10,
-            "keyword": 8,
-            "format": 6,
-            "content": 5,
-            "enhance": 3
+            "missing": 10, "keyword": 8, "format": 6, "content": 5, "enhance": 3
         }
-        
         for item in feedback:
             category = item.get("category", "content")
             item["impact_score"] = impact_weights.get(category, 5)
             item["effort_estimate"] = "medium"
             item["roi_score"] = item["impact_score"] / 2
-        
         feedback.sort(key=lambda x: x.get("roi_score", 0), reverse=True)
         return feedback[:10]
 
@@ -614,7 +543,6 @@ class ResumeService:
 app = FastAPI(title="Resume Service", version="1.0.0")
 resume_service = ResumeService()
 
-# Add CORS middleware
 allowed_origins = [origin.strip() for origin in FRONTEND_ORIGINS.split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -635,8 +563,6 @@ async def create_resume(
     background_tasks: BackgroundTasks = None,
     user_id: UUID = Depends(get_current_user_id)
 ):
-    """Create a new resume entry"""
-    
     resume = Resume(
         user_id=user_id,
         source_type=resume_data.source_type,
@@ -644,10 +570,8 @@ async def create_resume(
         raw_content="",
         is_active=True
     )
-    
     db.add(resume)
     await db.flush()
-    
     return {"id": str(resume.id), "status": "created"}
 
 @app.post("/v1/resumes/{resume_id}/parse")
@@ -657,21 +581,18 @@ async def parse_resume(
     db: AsyncSession = Depends(get_db),
     background_tasks: BackgroundTasks = None
 ):
-    """Parse resume content and extract structured data"""
-    
     result = await db.execute(select(Resume).where(Resume.id == resume_id))
     resume = result.scalar_one_or_none()
-    
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
-    
+
     parsed_data = await resume_service.parse_resume(resume_id, payload.raw_content)
-    
+
     resume.raw_content = payload.raw_content
     resume.parsed_data = parsed_data
-    
+
     for section_type, content in parsed_data.items():
-        if isinstance(content, dict) or isinstance(content, list):
+        if isinstance(content, (dict, list)):
             section = ResumeSection(
                 resume_id=resume.id,
                 section_type=section_type,
@@ -680,33 +601,22 @@ async def parse_resume(
                 confidence_score=0.95
             )
             db.add(section)
-    
+
     await db.commit()
-    
-    return {
-        "id": str(resume.id),
-        "parsed_data": parsed_data,
-        "status": "parsed"
-    }
+    return {"id": str(resume.id), "parsed_data": parsed_data, "status": "parsed"}
 
 @app.get("/v1/resumes/{resume_id}")
-async def get_resume(
-    resume_id: UUID,
-    db: AsyncSession = Depends(get_db)
-):
-    """Get resume with parsed data"""
-    
+async def get_resume(resume_id: UUID, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Resume).where(Resume.id == resume_id))
     resume = result.scalar_one_or_none()
-    
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
-    
+
     sections_result = await db.execute(
         select(ResumeSection).where(ResumeSection.resume_id == resume_id)
     )
     sections = sections_result.scalars().all()
-    
+
     return {
         "id": str(resume.id),
         "user_id": str(resume.user_id),
@@ -716,12 +626,7 @@ async def get_resume(
         "improvement_suggestions": resume.improvement_suggestions,
         "version": resume.version,
         "sections": [
-            {
-                "id": str(s.id),
-                "type": s.section_type,
-                "content": s.content,
-                "confidence": s.confidence_score
-            }
+            {"id": str(s.id), "type": s.section_type, "content": s.content, "confidence": s.confidence_score}
             for s in sections
         ],
         "created_at": resume.created_at.isoformat()
@@ -733,42 +638,25 @@ async def analyze_resume(
     payload: ResumeAnalyzePayload,
     db: AsyncSession = Depends(get_db)
 ):
-    """Run ATS analysis on resume"""
-    
     result = await db.execute(select(Resume).where(Resume.id == resume_id))
     resume = result.scalar_one_or_none()
-    
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
-    
     if not resume.parsed_data:
         raise HTTPException(status_code=400, detail="Resume not parsed yet")
-    
+
     analysis = await resume_service.calculate_ats_score(resume.parsed_data, payload.target_role)
-    
     resume.ats_score = analysis["overall"]
     resume.improvement_suggestions = analysis["improvements"]
-    
     await db.commit()
-    
-    return {
-        "resume_id": str(resume_id),
-        "analysis": analysis
-    }
+    return {"resume_id": str(resume_id), "analysis": analysis}
 
 @app.get("/v1/resumes/{resume_id}/improvements")
-async def get_improvements(
-    resume_id: UUID,
-    db: AsyncSession = Depends(get_db)
-):
-    """Get AI improvement suggestions"""
-    
+async def get_improvements(resume_id: UUID, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Resume).where(Resume.id == resume_id))
     resume = result.scalar_one_or_none()
-    
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
-    
     return {
         "resume_id": str(resume_id),
         "improvements": resume.improvement_suggestions or [],
@@ -782,8 +670,6 @@ async def update_section(
     section_data: Dict[str, Any],
     db: AsyncSession = Depends(get_db)
 ):
-    """Update a specific resume section"""
-    
     result = await db.execute(
         select(ResumeSection).where(
             ResumeSection.resume_id == resume_id,
@@ -791,7 +677,6 @@ async def update_section(
         )
     )
     section = result.scalar_one_or_none()
-    
     if section:
         section.content = section_data
         section.ai_extracted = False
@@ -803,27 +688,17 @@ async def update_section(
             ai_extracted=False
         )
         db.add(section)
-    
     await db.commit()
-    
     return {"status": "updated", "section_type": section_type}
 
 @app.delete("/v1/resumes/{resume_id}")
-async def delete_resume(
-    resume_id: UUID,
-    db: AsyncSession = Depends(get_db)
-):
-    """Soft delete a resume"""
-    
+async def delete_resume(resume_id: UUID, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Resume).where(Resume.id == resume_id))
     resume = result.scalar_one_or_none()
-    
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
-    
     resume.is_active = False
     await db.commit()
-    
     return {"status": "deleted"}
 
 @app.post("/api/upload-resume")
@@ -834,51 +709,40 @@ async def upload_resume(
 ):
     """
     Upload and analyze a resume file with STRICT validation.
-    This endpoint validates file type, extracts real text, and validates content.
     """
     try:
-        # ========== Step 1: File Type Validation ==========
+        # Step 1: File type validation
         if not resume_service.validate_file_type(resume.filename):
             raise HTTPException(
                 status_code=400,
                 detail="Invalid file type. Please upload a PDF, DOC, or DOCX file."
             )
-        
-        # ========== Step 2: Read File Content ==========
+
+        # Step 2: Read file content
         content = await resume.read()
-        
-        # Check file size
+
         if len(content) < 100:
-            raise HTTPException(
-                status_code=400,
-                detail="File is too small. Please upload a valid resume file."
-            )
-        
+            raise HTTPException(status_code=400, detail="File is too small. Please upload a valid resume file.")
+
         if len(content) > 5 * 1024 * 1024:  # 5MB
-            raise HTTPException(
-                status_code=400,
-                detail="File is too large. Maximum size is 5MB."
-            )
-        
-        # ========== Step 3: Extract Text Using Real Libraries ==========
+            raise HTTPException(status_code=400, detail="File is too large. Maximum size is 5MB.")
+
+        # Step 3: Extract text
         text = resume_service.extract_text_from_file(content, resume.filename)
         preview = text[:500].replace("\n", " ")
         print(f"[resume-upload] file={resume.filename} chars={len(text)} preview={preview}")
+
         if not text or len(text.strip()) < MIN_TEXT_LENGTH:
             raise HTTPException(
                 status_code=400,
                 detail="Could not extract readable text from file. Ensure it's a text-based PDF/DOCX, not a scanned image or encrypted file."
             )
 
-        # ========== Step 4: Strict Content Validation ==========
+        # Step 4: Content validation
         text_lower = text.lower()
-
         spam_indicators = [
-            "verification code",
-            "otp",
-            "click here to verify",
-            "security code",
-            "confirm your email",
+            "verification code", "otp", "click here to verify",
+            "security code", "confirm your email",
         ]
         if any(indicator in text_lower for indicator in spam_indicators):
             raise HTTPException(
@@ -888,17 +752,17 @@ async def upload_resume(
 
         has_email = bool(re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text))
         has_phone = bool(re.search(r'[\+\(]?[1-9][0-9 .\-\(\)]{8,}[0-9]', text))
-        
+
         section_indicators = {
             'experience': ['experience', 'employment', 'work history', 'professional experience', 'career'],
             'education': ['education', 'degree', 'university', 'college', 'bachelor', 'master', 'phd'],
             'skills': ['skills', 'technologies', 'proficiencies', 'technical skills', 'competencies']
         }
-        
-        matched_core_sections = 0
-        for keywords in section_indicators.values():
-            if any(keyword in text_lower for keyword in keywords):
-                matched_core_sections += 1
+
+        matched_core_sections = sum(
+            1 for keywords in section_indicators.values()
+            if any(keyword in text_lower for keyword in keywords)
+        )
 
         if not (has_email and has_phone and matched_core_sections >= 2):
             raise HTTPException(
@@ -913,22 +777,21 @@ async def upload_resume(
                 status_code=400,
                 detail="Could not extract readable text from file. The document appears too noisy or non-textual."
             )
-        
-        # ========== Step 5: Parse Resume ==========
+
+        # Step 5: Parse resume
         resume_id = uuid4()
         parsed = await resume_service.parse_resume(resume_id, text)
         print(
             f"[resume-parse] parsed_keys={list(parsed.keys())} "
             f"skills_count={len(resume_service._extract_skill_names(parsed))}"
         )
-        
-        # ========== Step 6: Generate ATS Analysis ==========
+
+        # Step 6: Generate ATS analysis
         analysis_result = await resume_service.generate_professional_ats_analysis(parsed)
-        
-        # ========== Step 7: Store Analysis in Database ==========
+
+        # Step 7: Store in database (non-fatal on failure)
         try:
             user_uuid = uuid4() if not user_id else UUID(user_id)
-            
             resume_analysis = ResumeAnalysis(
                 user_id=user_uuid,
                 file_name=resume.filename,
@@ -944,8 +807,8 @@ async def upload_resume(
             await db.commit()
         except Exception as db_error:
             print(f"Warning: Could not save to database: {db_error}")
-        
-        # ========== Step 8: Return Response ==========
+
+        # Step 8: Return response
         return {
             "ats_score": analysis_result["atsScore"],
             "skills_detected": analysis_result["skillsDetected"],
@@ -953,20 +816,23 @@ async def upload_resume(
             "strengths": analysis_result["strengths"],
             "improvements": analysis_result["improvements"],
             "suggestions": analysis_result["suggestions"],
-            "professional_feedback": analysis_result.get("professionalFeedback", _generate_analysis_summary(analysis_result["atsScore"])),
-            "analysis": analysis_result.get("professionalFeedback", _generate_analysis_summary(analysis_result["atsScore"]))
+            "professional_feedback": analysis_result.get(
+                "professionalFeedback",
+                _generate_analysis_summary(analysis_result["atsScore"])
+            ),
+            "analysis": analysis_result.get(
+                "professionalFeedback",
+                _generate_analysis_summary(analysis_result["atsScore"])
+            )
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing resume: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error processing resume: {str(e)}")
+
 
 def _generate_analysis_summary(ats_score: float) -> str:
-    """Generate a professional analysis summary based on ATS score"""
     if ats_score >= 80:
         return "Your resume is excellent! It has strong keywords, good formatting, and relevant experience. You're well-positioned for ATS screening."
     elif ats_score >= 60:
@@ -974,34 +840,22 @@ def _generate_analysis_summary(ats_score: float) -> str:
     else:
         return "Your resume needs work. Focus on adding more technical keywords, improving formatting, and including measurable achievements."
 
+
 @app.get("/api/resume-history")
 async def get_resume_history(
     user_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """Get resume analysis history for the logged-in user"""
     try:
-        if user_id:
-            user_uuid = UUID(user_id)
-        else:
-            user_uuid = None
-        
+        user_uuid = UUID(user_id) if user_id else None
+
+        query = select(ResumeAnalysis).order_by(desc(ResumeAnalysis.uploaded_at)).limit(20)
         if user_uuid:
-            result = await db.execute(
-                select(ResumeAnalysis)
-                .where(ResumeAnalysis.user_id == user_uuid)
-                .order_by(desc(ResumeAnalysis.uploaded_at))
-                .limit(20)
-            )
-        else:
-            result = await db.execute(
-                select(ResumeAnalysis)
-                .order_by(desc(ResumeAnalysis.uploaded_at))
-                .limit(20)
-            )
-        
+            query = query.where(ResumeAnalysis.user_id == user_uuid)
+
+        result = await db.execute(query)
         analyses = result.scalars().all()
-        
+
         return {
             "history": [
                 {
@@ -1022,9 +876,15 @@ async def get_resume_history(
     except Exception as e:
         return {"history": [], "total": 0, "error": str(e)}
 
+
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "resume"}
+    return {
+        "status": "healthy",
+        "service": "resume",
+        "ai_configured": bool(OPENROUTER_API_KEY),
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
